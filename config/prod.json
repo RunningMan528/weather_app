@@ -1,0 +1,12 @@
+{
+  "APP_ENV": "prod",
+  "CAIYUN_BASE_URL": "https://api.caiyunapp.com/v2.5/1swIXYicOc3JzdO5/",
+  "AMAP_BASE_URL": "https://restapi.amap.com/v3",
+  "AMAP_KEY": "caceb7c5a7360c22b0375af4d8ba24a7",
+  "ENABLE_HTTP_LOGGING": false,
+  "SENTRY_DSN": "https://b043798eec7f3a8fa296fd3ea737a01d@o4512337269358592.ingest.us.sentry.io/4512337277157376",
+  "SENTRY_ENVIRONMENT": "production",
+  "SENTRY_ENABLED": true,
+  "SENTRY_DEBUG": false,
+  "SENTRY_TRACES_SAMPLE_RATE_PERCENT": 10
+}

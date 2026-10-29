@@ -1,0 +1,107 @@
+# 移动端质量门禁（PR / 分支推送）
+#
+# 职责边界：本工作流**不产出可分发的安装包**，只做静态检查与业务回归，目的是让问题在合并前暴露，
+# 而不是等到打包阶段。构建与分发交给 android-qa.yml / ios-qa.yml（Fastlane 统一入口）。
+# 为什么不做成"构建前置依赖"：跨 workflow 依赖需要通过 workflow_run 实现，复杂度高、排错困难；
+# 更好的做法是让 Fastlane lane 自己也跑 analyze（见 fastlane/Fastfile 的 run_quality_gate）。
+name: 移动端质量门禁
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+    paths:
+      - "lib/**"
+      - "test/**"
+      - "tool/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "config/**"
+      - ".flutter-version"
+      - "analysis_options.yaml"
+      - "fastlane/**"
+      - "scripts/**"
+      - "Gemfile"
+      - "Gemfile.lock"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gate:
+    name: 静态检查与业务回归
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 读取项目 Flutter 版本
+        id: flutter_version
+        run: echo "version=$(cat .flutter-version)" >> "$GITHUB_OUTPUT"
+
+      - name: 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutter_version.outputs.version }}
+          channel: stable
+          cache: true
+
+      - name: 安装依赖
+        run: flutter pub get
+
+      - name: 校验环境配置（config/*.json）
+        # 文件名就是构建环境，配置内容的 APP_ENV 必须与之一致，避免 qa 包误连 prod 配置。
+        run: |
+          set -euo pipefail
+          for f in config/*.json; do
+            expected_env="$(basename "$f" .json)"
+            case "$expected_env" in
+              dev) expected_sentry_env="development" ;;
+              qa) expected_sentry_env="test" ;;
+              prod) expected_sentry_env="production" ;;
+              *) echo "::error::未知环境配置文件：$f"; exit 1 ;;
+            esac
+            jq -e --arg env "$expected_env" --arg sentry_env "$expected_sentry_env" '
+              (.APP_ENV == $env) and
+              (.CAIYUN_BASE_URL | type == "string" and length > 0 and endswith("/")) and
+              (.AMAP_BASE_URL | type == "string" and length > 0) and
+              (.AMAP_KEY | type == "string" and length > 0) and
+              (.SENTRY_DSN | type == "string" and length > 0) and
+              (.SENTRY_ENVIRONMENT == $sentry_env) and
+              (.ENABLE_HTTP_LOGGING | type == "boolean") and
+              (.SENTRY_ENABLED | type == "boolean") and
+              (.SENTRY_DEBUG | type == "boolean") and
+              (.SENTRY_TRACES_SAMPLE_RATE_PERCENT | type == "number" and . >= 0 and . <= 100)
+            ' "$f" > /dev/null \
+              || { echo "::error::$f 配置不完整，或 APP_ENV / SENTRY_ENVIRONMENT 与环境不匹配"; exit 1; }
+          done
+          echo "环境配置校验通过：$(ls config/*.json | xargs -n1 basename | tr '\n' ' ')"
+
+      - name: 代码格式校验
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: 静态分析（info 级问题也视为失败）
+        run: flutter analyze --fatal-infos
+
+      - name: 架构约束校验（分层与依赖方向）
+        run: dart run tool/check_architecture.dart
+
+      - name: Widget 测试与覆盖率
+        run: flutter test --coverage
+
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/lcov.info
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,0 +1,15 @@
+# fastlane match 的配置（可选方案：用 Git 仓库管理苹果证书与描述文件）。
+#
+# 什么时候用：
+#   团队多人协作 / 频繁新增测试设备 / 多个 App 共用同一套证书时，match 比"手工导出 p12 再传 Secret"更稳。
+# 怎么启用：
+#   1) 建一个**私有**证书仓库（里面只放加密后的证书，不要放业务代码）；
+#   2) 把下面的 YOUR_ORG 换成你的组织名，或直接设置环境变量 MATCH_GIT_URL；
+#   3) 首次在本地执行：MATCH_PASSWORD='强密码' bundle exec fastlane match appstore
+#   4) CI 里设置：USE_MATCH=1、MATCH_PASSWORD、MATCH_GIT_BASIC_AUTHORIZATION（或 SSH Deploy Key）。
+#
+# 注意：MATCH_PASSWORD 丢失 = 证书仓库无法解密，必须和 keystore 一样备份。
+git_url(ENV["MATCH_GIT_URL"] || "git@github.com:YOUR_ORG/ios-certificates.git")
+storage_mode("git")
+type("appstore")
+app_identifier(["com.wade.weather"])

@@ -1,0 +1,54 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+.idea/
+
+# 平台构建产物
+ios/Pods/
+ios/.symlinks/
+android/.gradle/
+android/local.properties
+
+# 系统文件
+.DS_Store
+
+# 签名材料与 CI 密钥（绝不入库；CI 通过 Secrets 注入）
+android/key.properties
+android/app/upload-keystore.jks
+*.jks
+*.keystore
+*.p12
+*.mobileprovision
+ios-profiles.zip
+firebase-service-account.json
+*.p8
+
+# Fastlane 产物（报告与预览是本地排错用的，不必入库）
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output/
+
+# 注意：Gemfile.lock 必须入库（锁定 fastlane 与插件版本，保证 CI 与本地一致）
+
+# ⚠️ 覆盖「全局 gitignore」对本仓库的误伤（~/.gitignore_global 里配了 pubspec.lock 等模式）。
+# 这类文件在 git status 里"静默消失"，本地一切正常、CI 却完全不同步：
+#   pubspec.lock        → CI 没有锁文件 → flutter pub get 每次重新解析 → 依赖悄悄升级
+#                         （2026-10：dio 5.9.2 → 5.11.1，新增枚举值让 release 构建编译失败）
+#   analysis_options.yaml → CI 上 analyze 用不到本项目的 lint / excludes 配置
+#   .metadata           → Flutter 工具的工程元数据（用于 flutter create 迁移）
+# 应用（不是 library）应当提交 pubspec.lock，这是"CI 与本地依赖一致"的前提。
+# 仓库级 .gitignore 的优先级高于全局 gitignore，所以下面这些 `!` 否定是生效的。
+!pubspec.lock
+!analysis_options.yaml
+!.metadata
+
+# 本地个人说明文档，不提交仓库
+PROJECT_GUIDE.md
+
+# 本地个人说明文档，不提交仓库
+Weather.md

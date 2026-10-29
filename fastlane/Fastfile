@@ -1,0 +1,590 @@
+# Fastfile：Android / iOS 的统一构建与分发入口
+#
+# 设计原则（与《CI_CD_配置说明》一致）：
+#   1) 构建与分发逻辑只放在 Fastlane，CI YAML 只负责调度 —— 换 CI（GitLab/CircleCI）不用重写流程；
+#   2) 平台参数严格分开：不把 Android 的 artifact 参数传给 iOS 上传（参考文档里提示过的坑）；
+#   3) 分发是"可选步骤"：未配置 Firebase / Telegram 时只构建并给出提示，而不是报错退出，
+#      这样在密钥还没准备好时流水线依然可用（先跑通构建，再逐步接入分发）；
+#   4) 版本号集中管理：默认读 pubspec.yaml，CI 可用 BUILD_NAME / BUILD_NUMBER 覆盖
+#      （GitHub Actions 传 github.run_number 实现构建号自增）；
+#   5) 不在日志里打印任何密钥。
+#
+# 常用命令：
+#   bundle exec fastlane android qa     # 构建 APK（+ 可选分发）
+#   bundle exec fastlane ios qa         # 构建 Ad Hoc IPA（+ 可选分发）
+#   bundle exec fastlane lanes          # 查看所有 lane
+
+require "json"
+require "net/http"
+require "uri"
+require "yaml"
+
+APP_BUNDLE_ID = "com.wade.weather".freeze
+SENTRY_ENVIRONMENTS = {
+  "dev" => "development",
+  "qa" => "test",
+  "prod" => "production"
+}.freeze
+REQUIRED_CONFIG_KEYS = %w[
+  APP_ENV
+  CAIYUN_BASE_URL
+  AMAP_BASE_URL
+  AMAP_KEY
+  ENABLE_HTTP_LOGGING
+  SENTRY_DSN
+  SENTRY_ENVIRONMENT
+  SENTRY_ENABLED
+  SENTRY_DEBUG
+  SENTRY_TRACES_SAMPLE_RATE_PERCENT
+].freeze
+
+default_platform(:android)
+
+# ---------------------------------------------------------------- 通用工具
+
+# 读取必需的环境变量；缺失时立刻失败并给出清晰提示（比构建到一半再炸好）。
+def required_env(name)
+  value = ENV[name].to_s
+  UI.user_error!("缺少环境变量：#{name}（请在 CI 的 Secrets 或本地 shell 中配置）") if value.empty?
+  value
+end
+
+# 项目根目录：Fastfile 位于 <root>/fastlane/ 下。
+def project_root
+  @project_root ||= File.expand_path("..", __dir__)
+end
+
+# pubspec.yaml 解析结果（缓存，避免重复读盘）。
+def pubspec
+  @pubspec ||= YAML.load_file(File.join(project_root, "pubspec.yaml"))
+end
+
+# 版本名：优先 BUILD_NAME，其次 pubspec.yaml 的 `version: x.y.z+n`。
+def app_version
+  @app_version ||= begin
+    from_env = ENV["BUILD_NAME"].to_s
+    from_env.empty? ? pubspec["version"].to_s.split("+").first : from_env
+  end
+end
+
+# 构建号：优先 BUILD_NUMBER（CI 用 run_number），否则取 pubspec 的 `+n`，最后回退 1。
+def app_build_number
+  @app_build_number ||= begin
+    from_env = ENV["BUILD_NUMBER"].to_s
+    from_env.empty? ? (pubspec["version"].to_s.split("+")[1] || "1") : from_env
+  end
+end
+
+def git_branch_name
+  ENV["GITHUB_REF_NAME"] || ENV["CI_COMMIT_REF_NAME"] || `git rev-parse --abbrev-ref HEAD`.strip
+end
+
+def commit_sha
+  ENV["GITHUB_SHA"] || ENV["CI_COMMIT_SHA"] || `git rev-parse HEAD`.strip
+end
+
+# ------------------------------------------------ 构建期配置（测试 / 生产）
+#
+# 环境档位由 BUILD_ENV 决定（默认 qa），对应 config/<env>.json，
+# 通过 `--dart-define-from-file` 在编译期注入，App 侧由 AppConfig 读取。
+# 为什么不用原生 flavor：iOS 需要额外维护同名 Xcode Scheme，成本高；
+# 当前"一套代码 + 配置文件"已覆盖测试/生产的差异，需要双包共存时再加 flavor。
+def build_env
+  @build_env ||= begin
+    value = ENV["BUILD_ENV"].to_s.strip.downcase
+    value = "qa" if value.empty?
+    allowed = Dir.glob(File.join(project_root, "config", "*.json"))
+                 .map { |path| File.basename(path, ".json") }
+                 .sort
+    unless allowed.include?(value)
+      UI.user_error!(
+        "未知的 BUILD_ENV=#{value}；可选值：#{allowed.join(' / ')}（对应 config/<env>.json）"
+      )
+    end
+    value
+  end
+end
+
+def env_config_path
+  File.join(project_root, "config", "#{build_env}.json")
+end
+
+# 构建前校验配置文件：缺失、JSON 写坏、APP_ENV 与 BUILD_ENV 不一致都要秒级失败。
+def validate_env_config!
+  path = env_config_path
+  UI.user_error!("缺少环境配置：#{path}") unless File.exist?(path)
+
+  data = JSON.parse(File.read(path))
+  if data["APP_ENV"].to_s != build_env
+    UI.user_error!(
+      "环境配置与 BUILD_ENV 不一致：#{path} 里 APP_ENV=#{data['APP_ENV'].inspect}，" \
+      "但 BUILD_ENV=#{build_env}（两者必须相同，否则 App 内显示的环境会骗人）"
+    )
+  end
+
+  missing = REQUIRED_CONFIG_KEYS.reject { |key| data.key?(key) }
+  UI.user_error!("环境配置缺少字段：#{missing.join(', ')}（#{path}）") unless missing.empty?
+
+  expected_sentry_env = SENTRY_ENVIRONMENTS[build_env]
+  if data["SENTRY_ENVIRONMENT"].to_s != expected_sentry_env
+    UI.user_error!(
+      "Sentry 环境隔离不一致：#{path} 的 SENTRY_ENVIRONMENT=" \
+      "#{data['SENTRY_ENVIRONMENT'].inspect}，期望 #{expected_sentry_env.inspect}"
+    )
+  end
+  unless data["CAIYUN_BASE_URL"].to_s.end_with?("/")
+    UI.user_error!("CAIYUN_BASE_URL 必须以 / 结尾：#{data['CAIYUN_BASE_URL'].inspect}")
+  end
+  sample_rate = data["SENTRY_TRACES_SAMPLE_RATE_PERCENT"]
+  unless sample_rate.is_a?(Numeric) && sample_rate.between?(0, 100)
+    UI.user_error!("SENTRY_TRACES_SAMPLE_RATE_PERCENT 必须是 0–100 的数字：#{sample_rate.inspect}")
+  end
+
+  UI.success(
+    "环境配置校验通过：#{build_env}（彩云: #{data['CAIYUN_BASE_URL']}；高德: #{data['AMAP_BASE_URL']}）"
+  )
+rescue JSON::ParserError => error
+  UI.user_error!("环境配置不是合法 JSON：#{path}（#{error.message}）")
+end
+
+def release_notes
+  [
+    "Flutter #{build_env.upcase} build",
+    "Env: #{build_env}",
+    "Version: #{app_version} (#{app_build_number})",
+    "Branch: #{git_branch_name}",
+    "Commit: #{commit_sha[0, 8]}"
+  ].join("\n")
+end
+
+# Flutter 构建参数：版本号从环境变量注入，配置从 config/<env>.json 注入。
+def flutter_build_args
+  args = []
+  args << "--build-name=#{app_version}" unless app_version.to_s.empty?
+  args << "--build-number=#{app_build_number}" unless app_build_number.to_s.empty?
+  args << "--dart-define-from-file=config/#{build_env}.json"
+  args.join(" ")
+end
+
+# 质量门禁：与 GitHub Actions 的静态检查保持一致（构建前先挡住明显问题）。
+#
+# ⚠️ 必须在**项目根目录**里执行：fastlane 的 `sh` 默认在 `fastlane/` 目录下运行，
+#    所以直接写 `flutter analyze` 时它分析的是 fastlane/ 自己 —— 日志里会看到
+#    "Analyzing fastlane... No issues found! (ran in 0.0s)"，门禁形同虚设。
+#    （`flutter pub get` 会自己向上找到 pubspec.yaml，看起来一切正常，更容易骗过人。）
+#    2026-10 那次「dio 5.11 新增枚举值 → switch 非穷尽 → release 编译失败」就是这么漏过去的：
+#    同样的代码在 CI 上 analyze 全绿，直到 build apk 才炸。
+def run_quality_gate
+  Dir.chdir(project_root) do
+    sh("flutter pub get")
+    sh("dart format --output=none --set-exit-if-changed lib test tool")
+    sh("flutter analyze --fatal-infos")
+    sh("dart run tool/check_architecture.dart")
+  end
+end
+
+# 是否具备分发条件：App ID 与服务账号缺一不可。
+def firebase_ready?(app_id_env)
+  return false if ENV[app_id_env].to_s.empty?
+  return false if ENV["GOOGLE_APPLICATION_CREDENTIALS"].to_s.empty?
+  true
+end
+
+# Firebase 上传的公共参数。
+def firebase_common_options
+  options = {
+    service_credentials_file: required_env("GOOGLE_APPLICATION_CREDENTIALS"),
+    release_notes: release_notes
+  }
+  group = ENV["FIREBASE_TESTER_GROUP"].to_s
+  options[:groups] = group unless group.empty?
+  options
+end
+
+# ---------------------------------------------- 分发凭据预检（构建前跑，秒级失败）
+
+# 校验服务账号密钥：必须是 Google Cloud 的**服务账号密钥** JSON，
+# 而不是 Firebase 控制台的 google-services.json、也不是 OAuth 客户端 JSON。
+#
+# 为什么要单独校验：这三者都是**合法 JSON**，极易混淆；插件拿到错文件时只会抛出
+# 一长串 Ruby 栈（googleauth: `missing client_email`），而且是在 7 分钟的 Gradle
+# 构建之后才报 —— 白等一整轮。这里提前到秒级失败，并直接给出修复路径。
+def validate_service_account!(platform_label)
+  path = ENV["GOOGLE_APPLICATION_CREDENTIALS"].to_s
+  if path.empty?
+    UI.user_error!("GOOGLE_APPLICATION_CREDENTIALS 为空，无法校验 #{platform_label} 分发凭据")
+  end
+  UI.user_error!("服务账号文件不存在：#{path}") unless File.exist?(path)
+
+  begin
+    json = JSON.parse(File.read(path))
+  rescue JSON::ParserError => error
+    UI.user_error!(
+      "#{platform_label} 分发凭据不是合法 JSON：#{error.message}\n" \
+      "  常见原因：Secret 里多带了引号/转义符，或粘贴的不是文件内容本身。"
+    )
+  end
+
+  unless json.is_a?(Hash)
+    UI.user_error!("#{platform_label} 分发凭据的 JSON 顶层不是对象（当前是 #{json.class}），请粘贴完整的密钥文件内容。")
+  end
+
+  # 1) 认错文件：Firebase 的应用配置文件
+  if json.key?("project_info") || json.key?("api_key") || json.key?("client")
+    UI.user_error!(
+      "#{platform_label} 分发凭据看起来是 Firebase 的 google-services.json（应用配置文件），不是服务账号密钥。\n" \
+      "  google-services.json  ：给 App 内的 firebase_core 用，字段是 project_info / client / api_key\n" \
+      "  服务账号密钥（要这个）：给 CI 上传用，字段是 \"type\": \"service_account\" / client_email / private_key\n" \
+      "  获取路径：Google Cloud Console → IAM 和管理 → 服务账号 → 选择或新建服务账号 → " \
+      "密钥 → 添加密钥 → 创建新密钥 → JSON → 下载"
+    )
+  end
+
+  # 2) 认错文件：OAuth 客户端 / 字段缺失
+  unless json["client_email"].to_s.include?(".iam.gserviceaccount.com")
+    UI.user_error!(
+      "#{platform_label} 分发凭据缺少 client_email（当前值：#{json["client_email"].inspect}）。\n" \
+      "  需要的字段：\"type\": \"service_account\"、client_email、private_key、project_id\n" \
+      "  若下载的是 OAuth 客户端（client_secret_*.json，含 client_id / client_secret），请改下载服务账号密钥。"
+    )
+  end
+
+  if json["private_key"].to_s.empty?
+    UI.user_error!("#{platform_label} 分发凭据缺少 private_key（文件可能被截断，例如只贴进去一部分）。")
+  end
+
+  UI.success("#{platform_label} 分发凭据校验通过：#{json["client_email"]}")
+end
+
+# 统一包装 Firebase 上传：失败时按错误特征补上排查提示，再原样抛出（不吞异常）。
+def upload_to_firebase(options)
+  firebase_app_distribution(**options)
+rescue StandardError => error
+  message = error.message.to_s
+  UI.error("Firebase App Distribution 上传失败：#{message}")
+  if message =~ /403|permission|PERMISSION_DENIED/i
+    UI.error("  排查：服务账号缺少『Firebase App Distribution Admin』角色（GCP → IAM → 服务账号 → 权限）")
+  end
+  if message =~ /404|not found|NOT_FOUND/i
+    UI.error("  排查：App ID 与工程不匹配（Android 看 applicationId、iOS 看 Bundle ID），" \
+             "且 Firebase 控制台需要先启用 App Distribution")
+  end
+  if message =~ /400|invalid/i
+    UI.error("  排查：产物不完整或未签名（release 包必须已签名）")
+  end
+  if message =~ /auth|token|credential/i
+    UI.error("  排查：服务账号密钥是否已过期/被删除（GCP → 服务账号 → 密钥）")
+  end
+  raise
+end
+
+# 插件不同版本返回字段不同，这里做兼容取值。
+def distribution_link(release)
+  return ENV["FIREBASE_CONSOLE_URL"] if !release.is_a?(Hash)
+
+  release[:testing_uri] ||
+    release["testingUri"] ||
+    release[:testingUri] ||
+    release[:firebase_console_uri] ||
+    release["firebaseConsoleUri"] ||
+    release[:firebaseConsoleUri] ||
+    ENV["FIREBASE_CONSOLE_URL"] ||
+    "Firebase App Distribution Console"
+end
+
+# Telegram 通知：未配置时跳过（本地调试不需要）。
+def send_telegram(message)
+  token = ENV["TELEGRAM_BOT_TOKEN"].to_s
+  chat_id = ENV["TELEGRAM_CHAT_ID"].to_s
+  if token.empty? || chat_id.empty?
+    UI.message("未配置 Telegram，跳过通知。")
+    return
+  end
+
+  uri = URI("https://api.telegram.org/bot#{token}/sendMessage")
+  request = Net::HTTP::Post.new(uri)
+  request.set_form_data(
+    "chat_id" => chat_id,
+    "text" => message,
+    "disable_web_page_preview" => "true"
+  )
+
+  response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 10, read_timeout: 20) do |http|
+    http.request(request)
+  end
+
+  unless response.is_a?(Net::HTTPSuccess) && JSON.parse(response.body)["ok"]
+    UI.error("Telegram 通知发送失败：HTTP #{response.code}")
+    return
+  end
+  UI.success("Telegram 通知已发送。")
+end
+
+def notify_success(platform_name, link)
+  send_telegram([
+    "✅ Flutter QA build uploaded",
+    "Platform: #{platform_name}",
+    "Version: #{app_version} (#{app_build_number})",
+    "Branch: #{git_branch_name}",
+    "Commit: #{commit_sha[0, 8]}",
+    "Download: #{link}"
+  ].join("\n"))
+end
+
+# ---------------------------------------------------------------- 构建
+
+def android_apk_path
+  File.join(project_root, "build/app/outputs/flutter-apk/app-release.apk")
+end
+
+def build_android
+  run_quality_gate
+  # 同样固定在项目根目录执行，避免依赖 Flutter 工具自己"往上找项目"的行为。
+  Dir.chdir(project_root) do
+    sh("flutter build apk --release #{flutter_build_args}".strip)
+  end
+  UI.success("APK 已生成：#{android_apk_path}")
+end
+
+def ios_ipa_path
+  ipa_dir = File.join(project_root, "build/ios/ipa")
+  ipa_files = Dir.glob(File.join(ipa_dir, "*.ipa"))
+  UI.user_error!("未找到 IPA：#{ipa_dir}（请检查签名与导出配置）") if ipa_files.empty?
+  ipa_files.max_by { |path| File.mtime(path) }
+end
+
+def build_ios
+  run_quality_gate
+  Dir.chdir(project_root) do
+    sh("flutter build ipa --release #{flutter_build_args} --export-method=ad-hoc".strip)
+  end
+end
+
+# ------------------------------------------------ TestFlight（App Store 分发）
+#
+# 与 Ad Hoc（lane :qa）的区别只有两点：
+#   1) Flutter 使用 --export-method=app-store 生成 App Store IPA；
+#   2) 构建完不上传 Firebase，而是 upload_to_testflight。
+#
+# 证书尚未就绪时，先跑 `bundle exec fastlane ios testflight_check`：
+# 它会逐项打印缺什么、去哪里补，不会触发构建。
+
+
+def use_match?
+  ENV["USE_MATCH"].to_s == "1"
+end
+
+def testflight_upload_enabled?
+  ENV["TESTFLIGHT_SKIP_UPLOAD"].to_s != "1"
+end
+
+# App Store Connect API Key（.p8）。CI 用文件路径，本地也可以直接用内容。
+def app_store_connect_key
+  @app_store_connect_key ||= begin
+    options = {
+      key_id: required_env("ASC_KEY_ID"),
+      issuer_id: required_env("ASC_ISSUER_ID"),
+      duration: 1200
+    }
+    key_path = ENV["ASC_KEY_PATH"].to_s
+    key_content = ENV["ASC_KEY_CONTENT"].to_s
+    if !key_path.empty?
+      UI.user_error!("ASC_KEY_PATH 指向的 .p8 不存在：#{key_path}") unless File.exist?(key_path)
+      options[:key_filepath] = key_path
+    elsif !key_content.empty?
+      options[:key_content] = key_content
+    else
+      UI.user_error!(
+        "缺少 App Store Connect API Key：配置 ASC_KEY_PATH（.p8 文件路径）" \
+        "或 ASC_KEY_CONTENT（.p8 文件内容）"
+      )
+    end
+    app_store_connect_api_key(**options)
+  end
+end
+
+def signing_identity_output
+  `security find-identity -v -p codesigning 2>/dev/null`
+end
+
+def distribution_identity_available?
+  output = signing_identity_output
+  output.include?("Apple Distribution") || output.include?("iPhone Distribution")
+end
+
+# 生成"前置条件清单"：[名称, 是否就绪, 如何补]。
+# 注意：只做本地/环境变量检查，不访问网络，因此可以随时安全执行。
+def testflight_prerequisite_checks
+  checks = []
+
+  if testflight_upload_enabled?
+    checks << ["ASC_KEY_ID", !ENV["ASC_KEY_ID"].to_s.empty?,
+               "App Store Connect → Users and Access → Integrations → App Store Connect API → Key ID"]
+    checks << ["ASC_ISSUER_ID", !ENV["ASC_ISSUER_ID"].to_s.empty?,
+               "同上页面的 Issuer ID"]
+    checks << ["ASC_KEY_PATH / ASC_KEY_CONTENT",
+               !ENV["ASC_KEY_PATH"].to_s.empty? || !ENV["ASC_KEY_CONTENT"].to_s.empty?,
+               "下载 .p8 后：CI 里把整份内容写进 ASC_KEY_CONTENT；本地可设 ASC_KEY_PATH"]
+  end
+
+  if use_match?
+    matchfile = File.join(project_root, "fastlane/Matchfile")
+    match_url_ready = !ENV["MATCH_GIT_URL"].to_s.empty? ||
+                      (File.exist?(matchfile) && !File.read(matchfile).include?("YOUR_ORG"))
+    checks << ["MATCH_PASSWORD（USE_MATCH=1）", !ENV["MATCH_PASSWORD"].to_s.empty?,
+               "证书仓库（match）的加密口令"]
+    checks << ["match 证书仓库地址", match_url_ready,
+               "把 fastlane/Matchfile 里的 YOUR_ORG 换成真实仓库，或设置 MATCH_GIT_URL"]
+  else
+    checks << ["Apple Distribution 证书", distribution_identity_available?,
+               "CI：配齐 IOS_CERTIFICATE_P12_BASE64 等 4 个 Secret 并先跑 setup_ios_signing.sh；" \
+               "本地：导入 .p12，或用 Xcode → Manage Certificates 生成 Apple Distribution"]
+    checks << ["IOS_PROFILES_ZIP_BASE64（含 App Store Profile）",
+               !ENV["IOS_PROFILES_ZIP_BASE64"].to_s.empty?,
+               "描述文件 ZIP 里必须包含 App Store 类型（不是 Ad Hoc）"]
+  end
+
+  checks
+end
+
+def validate_testflight_prerequisites!
+  missing = testflight_prerequisite_checks.reject { |_, ok, _| ok }
+  return if missing.empty?
+
+  lines = missing.map { |name, _, hint| "  ❌ #{name}\n     → #{hint}" }.join("\n")
+  UI.user_error!(
+    "TestFlight 前置条件未就绪（#{missing.size} 项）：\n#{lines}\n\n" \
+    "配置说明与 Secrets 清单见 README.md 的「CI/CD」章节。"
+  )
+end
+
+def build_ios_appstore
+  run_quality_gate
+  Dir.chdir(project_root) do
+    sh("flutter build ipa --release #{flutter_build_args} --export-method=app-store".strip)
+  end
+end
+
+# ---------------------------------------------------------------- 分发
+
+def distribute_android
+  path = android_apk_path
+  UI.user_error!("APK 不存在：#{path}") unless File.exist?(path)
+
+  unless firebase_ready?("FIREBASE_ANDROID_APP_ID")
+    UI.important("未配置 Firebase（FIREBASE_ANDROID_APP_ID / GOOGLE_APPLICATION_CREDENTIALS），跳过分发。")
+    UI.important("产物仍可从 CI Artifact 下载：build/app/outputs/flutter-apk/app-release.apk")
+    return
+  end
+
+  release = upload_to_firebase(
+    app: required_env("FIREBASE_ANDROID_APP_ID"),
+    android_artifact_type: "APK",
+    android_artifact_path: path,
+    **firebase_common_options
+  )
+  notify_success("Android", distribution_link(release))
+end
+
+def distribute_ios
+  path = ios_ipa_path
+  unless firebase_ready?("FIREBASE_IOS_APP_ID")
+    UI.important("未配置 Firebase（FIREBASE_IOS_APP_ID / GOOGLE_APPLICATION_CREDENTIALS），跳过分发。")
+    UI.important("产物仍可从 CI Artifact 下载：build/ios/ipa/*.ipa")
+    return
+  end
+
+  release = upload_to_firebase(
+    app: required_env("FIREBASE_IOS_APP_ID"),
+    ipa_path: path,
+    **firebase_common_options
+  )
+  notify_success("iOS", distribution_link(release))
+end
+
+# ---------------------------------------------------------------- 生命周期
+
+before_all do
+  ENV["FASTLANE_DISABLE_ANALYTICS"] = "true"
+  validate_env_config!
+  UI.message(
+    "项目：#{pubspec['name']}｜环境：#{build_env}｜版本：#{app_version} (#{app_build_number})｜" \
+    "分支：#{git_branch_name}"
+  )
+end
+
+# ---------------------------------------------------------------- lanes
+
+platform :android do
+  desc "构建 Android Release APK，并在配置齐全时分发到 Firebase App Distribution"
+  lane :qa do
+    # 先做分发凭据预检（秒级）：凭据配错时立刻失败并给出可操作提示，
+    # 而不是等 7 分钟的 Gradle 构建跑完、在最后一步才抛 googleauth 的 Ruby 栈。
+    # 注意：这里只在"确实配置了分发凭据"时校验；没配 = 本次不分发，交给 distribute_android 统一提示跳过。
+    validate_service_account!("Android") if firebase_ready?("FIREBASE_ANDROID_APP_ID")
+    build_android
+    distribute_android
+  end
+end
+
+platform :ios do
+  desc "构建 iOS Ad Hoc IPA，并在配置齐全时分发到 Firebase App Distribution"
+  lane :qa do
+    validate_service_account!("iOS") if firebase_ready?("FIREBASE_IOS_APP_ID")
+    build_ios
+    distribute_ios
+  end
+
+  desc "构建 App Store 包并上传 TestFlight（证书与 ASC Key 就绪后可用）"
+  lane :beta do
+    # 构建前先把"缺什么"说清楚：证书/Profile/API Key 任何一个没准备，
+    # 都不要浪费一次 10+ 分钟的 macOS 构建。
+    validate_testflight_prerequisites!
+
+    # 可选：USE_MATCH=1 时由 match 拉取 App Store 证书与描述文件；
+    # 默认走 Secrets 方案（CI 已在进入 lane 前执行 setup_ios_signing.sh）。
+    if use_match?
+      match(type: "appstore", readonly: true, app_identifier: APP_BUNDLE_ID)
+    end
+
+    build_ios_appstore
+
+    if testflight_upload_enabled?
+      options = {
+        api_key: app_store_connect_key,
+        ipa: ios_ipa_path,
+        changelog: release_notes,
+        # 不等苹果处理：构建处理通常要几分钟到几十分钟，没必要占用 Runner。
+        skip_waiting_for_build_processing: true
+      }
+      groups = ENV["TESTFLIGHT_GROUPS"].to_s
+      options[:groups] = groups unless groups.empty?
+
+      upload_to_testflight(**options)
+      UI.success(
+        "已上传 TestFlight：v#{app_version} (#{app_build_number})。" \
+        "处理完成后可在 App Store Connect → TestFlight 分发给测试员。"
+      )
+    else
+      UI.important("TESTFLIGHT_SKIP_UPLOAD=1：只构建 IPA，跳过 TestFlight 上传。")
+      UI.important("产物：#{ios_ipa_path}")
+    end
+  end
+
+  desc "只检查 TestFlight 前置条件（不构建、不上传）"
+  lane :testflight_check do
+    checks = testflight_prerequisite_checks
+    checks.each do |name, ok, hint|
+      if ok
+        UI.success("✅ #{name}")
+      else
+        UI.important("❌ #{name}\n   → #{hint}")
+      end
+    end
+
+    missing = checks.reject { |_, ok, _| ok }
+    UI.user_error!("还有 #{missing.size} 项未就绪，按提示替换后重跑本 lane。") unless missing.empty?
+
+    UI.success("TestFlight 前置条件全部就绪，可以执行：bundle exec fastlane ios beta")
+  end
+end

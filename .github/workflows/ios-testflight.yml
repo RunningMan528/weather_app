@@ -1,0 +1,149 @@
+# iOS TestFlight 发布流水线
+#
+# 与 ios-qa.yml 的区别：
+#   - 产物是 App Store 包（Flutter --export-method=app-store），上传 TestFlight 而不是 Firebase；
+#   - 只允许手动触发或打 v* tag，默认 BUILD_ENV=prod；
+#   - 证书 / Profile / API Key 未就绪时，Fastlane 会在构建前给出"缺什么、去哪补"的清单，
+#     不会白等一次 10+ 分钟的 macOS 构建。
+#
+# 两种签名方案（用仓库变量 USE_MATCH 切换）：
+#   USE_MATCH=0（默认）：Secrets 手传 p12 + 描述文件，由 scripts/ci/setup_ios_signing.sh 安装
+#   USE_MATCH=1        ：fastlane match 从私有证书仓库拉取（需 MATCH_PASSWORD 等）
+#
+# Secrets 清单与常用命令见 README.md 的「CI/CD」章节。
+name: iOS TestFlight 发布
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_env:
+        description: "构建环境（对应 config/<env>.json）"
+        type: choice
+        options: [prod, qa]
+        default: prod
+      skip_upload:
+        description: "只构建 IPA、不上传 TestFlight（用于先验证签名链路）"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-testflight-${{ github.ref }}
+  # 发布流水线不互相取消：避免上传到一半被同一分支的新提交打断。
+  cancel-in-progress: false
+
+jobs:
+  ios-testflight:
+    name: 构建 App Store 包并上传 TestFlight
+    runs-on: macos-latest
+    timeout-minutes: 60
+    # 生产发布建议启用人工审批（在仓库 Settings → Environments 建 production 并加 Required reviewers）：
+    # environment: production
+
+    env:
+      BUILD_ENV: ${{ inputs.build_env || 'prod' }}
+      TESTFLIGHT_SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '0' }}
+      USE_MATCH: ${{ vars.USE_MATCH || '0' }}
+      MATCH_GIT_URL: ${{ vars.MATCH_GIT_URL }}
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      TESTFLIGHT_GROUPS: ${{ vars.TESTFLIGHT_GROUPS }}
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 生成唯一构建号
+        # run_number * 100 + run_attempt：跨运行递增，同一次运行的失败重试也不会复用上传号。
+        run: |
+          set -euo pipefail
+          attempt="${GITHUB_RUN_ATTEMPT:-1}"
+          echo "BUILD_NUMBER=$(( GITHUB_RUN_NUMBER * 100 + attempt ))" >> "$GITHUB_ENV"
+
+      - name: 校验发布 Tag 与 pubspec 版本
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version: *\([^+]*\).*/\1/p' pubspec.yaml | head -n 1)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} 与 pubspec.yaml 版本 v${version} 不一致"
+            exit 1
+          fi
+
+      - name: 查看 Xcode 版本
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          sw_vers
+
+      - name: 读取项目 Flutter 版本
+        id: flutter_version
+        run: echo "version=$(cat .flutter-version)" >> "$GITHUB_OUTPUT"
+
+      - name: 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutter_version.outputs.version }}
+          channel: stable
+          cache: true
+
+      - name: 配置 Ruby 与 Bundler
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      - name: 安装 iOS 签名材料（Secrets 方案）
+        if: ${{ env.USE_MATCH != '1' }}
+        env:
+          IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROFILES_ZIP_BASE64: ${{ secrets.IOS_PROFILES_ZIP_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: bash scripts/ci/setup_ios_signing.sh
+
+      - name: 准备 App Store Connect API Key
+        # skip_upload=true 时不需要 API Key（只验证签名与构建）。
+        if: ${{ inputs.skip_upload != true }}
+        env:
+          ASC_KEY_CONTENT: ${{ secrets.ASC_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ASC_KEY_CONTENT:-}" ]; then
+            echo "::error::未配置 ASC_KEY_CONTENT（App Store Connect API Key 的 .p8 完整内容）"
+            exit 1
+          fi
+          printf '%s\n' "$ASC_KEY_CONTENT" > "$RUNNER_TEMP/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/AuthKey.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: 构建并上传 TestFlight（Fastlane）
+        run: |
+          set -o pipefail
+          bundle exec fastlane ios beta 2>&1 | tee "$RUNNER_TEMP/testflight.log"
+
+      - name: 失败诊断（签名 / 上传 / 前置条件）
+        if: failure()
+        run: |
+          set +e
+          echo "===== 日志里的根因候选 ====="
+          grep -n -i -m 60 -E "FAILURE:|error:|Caused by:|No signing certificate|No profiles for|exportArchive|Authentication|Unauthorized|Forbidden|ITMS|altool|Transporter|Invalid" \
+            "$RUNNER_TEMP/testflight.log" || echo "（未匹配到已知模式）"
+          echo
+          echo "===== 前置条件清单（不构建） ====="
+          bundle exec fastlane ios testflight_check 2>&1 | tail -40 || true
+
+      - name: 上传 IPA 产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-testflight-ipa
+          path: build/ios/ipa/*.ipa
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,0 +1,129 @@
+# iOS QA 分发流水线
+#
+# 结构：与 Android 流水线同构，只有"调度层"不同（macOS Runner + 签名材料安装）。
+# 触发：手动（workflow_dispatch）+ 推送到 main 且命中路径过滤。
+# 注意：macos-latest 的 Xcode 版本会随 GitHub Runner 更新；如果项目对 Xcode 版本敏感，
+#      需要固定 Runner 镜像（例如 macos-15）并在此显式核对 xcodebuild -version。
+name: iOS QA 分发
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_env:
+        description: "构建环境（对应 config/<env>.json）"
+        type: choice
+        options: [qa, prod]
+        default: qa
+  push:
+    branches: [main]
+    paths:
+      - "lib/**"
+      - "ios/**"
+      - "test/**"
+      - "tool/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - "config/**"
+      - ".flutter-version"
+      - "fastlane/**"
+      - "Gemfile"
+      - "Gemfile.lock"
+      - "scripts/ci/**"
+      - ".github/workflows/ios-qa.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-qa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios-qa:
+    name: 构建 IPA 并分发
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    env:
+      # 构建环境：手动触发时可选 qa/prod；push 触发默认 qa。
+      BUILD_ENV: ${{ inputs.build_env || 'qa' }}
+      FIREBASE_IOS_APP_ID: ${{ secrets.FIREBASE_IOS_APP_ID }}
+      FIREBASE_TESTER_GROUP: ${{ vars.FIREBASE_TESTER_GROUP }}
+      FIREBASE_CONSOLE_URL: ${{ vars.FIREBASE_CONSOLE_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 生成唯一构建号
+        # run_number * 100 + run_attempt：跨运行递增，同一次运行的失败重试也不会复用上传号。
+        run: |
+          set -euo pipefail
+          attempt="${GITHUB_RUN_ATTEMPT:-1}"
+          echo "BUILD_NUMBER=$(( GITHUB_RUN_NUMBER * 100 + attempt ))" >> "$GITHUB_ENV"
+
+      - name: 查看 Xcode 版本
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: 读取项目 Flutter 版本
+        id: flutter_version
+        run: echo "version=$(cat .flutter-version)" >> "$GITHUB_OUTPUT"
+
+      - name: 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutter_version.outputs.version }}
+          channel: stable
+          cache: true
+
+      - name: 配置 Ruby 与 Bundler
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      - name: 安装 iOS 签名材料（临时 Keychain + 证书 + Profile）
+        env:
+          IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROFILES_ZIP_BASE64: ${{ secrets.IOS_PROFILES_ZIP_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: bash scripts/ci/setup_ios_signing.sh
+
+      - name: 准备 Firebase 服务账号
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FIREBASE_SERVICE_ACCOUNT_JSON:-}" ]; then
+            echo "未配置 FIREBASE_SERVICE_ACCOUNT_JSON：本次只构建，不分发。"
+            exit 0
+          fi
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-service-account.json"
+          chmod 600 "$RUNNER_TEMP/firebase-service-account.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/firebase-service-account.json" >> "$GITHUB_ENV"
+
+      - name: 构建与分发（Fastlane）
+        run: |
+          set -o pipefail
+          bundle exec fastlane ios qa 2>&1 | tee "$RUNNER_TEMP/fastlane.log"
+
+      - name: 失败诊断
+        if: failure()
+        run: |
+          set +e
+          grep -n -i -m 60 -E "FAILURE:|error:|Caused by:|No signing certificate|No profiles for|exportArchive|Swift Package|Authentication|Unauthorized|Forbidden" \
+            "$RUNNER_TEMP/fastlane.log" || echo "（未匹配到已知模式）"
+
+      - name: 上传 IPA 产物（排错留档）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-qa-ipa
+          path: build/ios/ipa/*.ipa
+          if-no-files-found: ignore
+          retention-days: 7

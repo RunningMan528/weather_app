@@ -1,0 +1,4 @@
+# Fastlane 插件清单。
+# 注意：Pluginfile 通过 Gemfile 的 eval_gemfile 生效，
+# 因此 gem 版本同样由 Gemfile.lock 锁定（CI 与本地一致）。
+gem "fastlane-plugin-firebase_app_distribution", "~> 1.0"
